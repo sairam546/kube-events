@@ -2,6 +2,11 @@ package controller
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
 	"github.com/sairam546/kube-events/pkg/utils"
 	"github.com/Sirupsen/logrus"
 
@@ -14,7 +19,13 @@ import (
 	api_v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/util/workqueue"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
+
+const maxRetries = 5
+
+var serverStartTime time.Time
 
 // Event indicate the informerEvent
 type Event struct {
@@ -33,8 +44,6 @@ type Controller struct {
 }
 
 func Start() {
-	fmt.Println("in controller.go Start")
-
 	var kubeClient kubernetes.Interface
 	_, err := rest.InClusterConfig()
 	if err != nil {
@@ -42,8 +51,6 @@ func Start() {
 	} else {
 		kubeClient = utils.GetClient()
 	}
-
-	fmt.Println(kubeClient)
 
 	if true {
 		informer := cache.NewSharedIndexInformer(
@@ -60,14 +67,17 @@ func Start() {
 			cache.Indexers{},
 		)
 
-		fmt.Println(informer)
 		c := newResourceController(kubeClient, informer, "pod")
-		fmt.Println(c)
-		//stopCh := make(chan struct{})
-		//defer close(stopCh)
+		stopCh := make(chan struct{})
+		defer close(stopCh)
 
-		//go c.Run(stopCh)
+		go c.Run(stopCh)
 	}
+
+	sigterm := make(chan os.Signal, 1)
+	signal.Notify(sigterm, syscall.SIGTERM)
+	signal.Notify(sigterm, syscall.SIGINT)
+	<-sigterm
 }
 
 func newResourceController(client kubernetes.Interface, informer cache.SharedIndexInformer, resourceType string) *Controller {
@@ -79,18 +89,16 @@ func newResourceController(client kubernetes.Interface, informer cache.SharedInd
 			newEvent.key, err = cache.MetaNamespaceKeyFunc(obj)
 			newEvent.eventType = "create"
 			newEvent.resourceType = resourceType
-			logrus.WithField("pkg", "kubewatch-"+resourceType).Infof("Processing add to %v: %s", resourceType, newEvent.key)
 			if err == nil {
-				//queue.Add(newEvent)
+				queue.Add(newEvent)
 			}
 		},
 		UpdateFunc: func(old, new interface{}) {
 			newEvent.key, err = cache.MetaNamespaceKeyFunc(old)
 			newEvent.eventType = "update"
 			newEvent.resourceType = resourceType
-			logrus.WithField("pkg", "kubewatch-"+resourceType).Infof("Processing update to %v: %s", resourceType, newEvent.key)
 			if err == nil {
-				//queue.Add(newEvent)
+				queue.Add(newEvent)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -98,17 +106,80 @@ func newResourceController(client kubernetes.Interface, informer cache.SharedInd
 			newEvent.eventType = "delete"
 			newEvent.resourceType = resourceType
 			newEvent.namespace = utils.GetObjectMetaData(obj).Namespace
-			logrus.WithField("pkg", "kubewatch-"+resourceType).Infof("Processing delete to %v: %s", resourceType, newEvent.key)
 			if err == nil {
-				//queue.Add(newEvent)
+				queue.Add(newEvent)
 			}
 		},
 	})
 
 	return &Controller{
-		logger:       logrus.WithField("pkg", "kubewatch-"+resourceType),
+		logger:       logrus.WithField("by", "controller log"),
 		clientset:    client,
 		informer:     informer,
 		queue:        queue,
 	}
+}
+
+func (c *Controller) Run(stopCh <-chan struct{}) {
+	defer utilruntime.HandleCrash()
+	defer c.queue.ShutDown()
+
+	c.logger.Info("Starting controller")
+	serverStartTime = time.Now().Local()
+
+	go c.informer.Run(stopCh)
+
+	if !cache.WaitForCacheSync(stopCh, c.HasSynced) {
+		utilruntime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
+		return
+	}
+
+	c.logger.Info("controller synced and ready")
+
+	wait.Until(c.runWorker, time.Second, stopCh)
+}
+
+func (c *Controller) HasSynced() bool {
+	return c.informer.HasSynced()
+}
+
+func (c *Controller) LastSyncResourceVersion() string {
+	return c.informer.LastSyncResourceVersion()
+}
+
+func (c *Controller) runWorker() {
+	for c.processNextItem() {
+	}
+}
+
+func (c *Controller) processNextItem() bool {
+	newEvent, quit := c.queue.Get()
+
+	if quit {
+		return false
+	}
+	defer c.queue.Done(newEvent)
+	err := c.processItem(newEvent.(Event))
+	if err == nil {
+		c.queue.Forget(newEvent)
+	} else if c.queue.NumRequeues(newEvent) < maxRetries {
+		c.logger.Errorf("Error processing %s (will retry): %v", newEvent.(Event).key, err)
+		c.queue.AddRateLimited(newEvent)
+	} else {
+		c.logger.Errorf("Error processing %s (giving up): %v", newEvent.(Event).key, err)
+		c.queue.Forget(newEvent)
+		utilruntime.HandleError(err)
+	}
+
+	return true
+}
+
+func (c *Controller) processItem(newEvent Event) error {
+	obj, _, err := c.informer.GetIndexer().GetByKey(newEvent.key)
+	if err != nil {
+		return fmt.Errorf("Error fetching object with key %s from store: %v", newEvent.key, err)
+	}
+	_ = utils.GetObjectMetaData(obj)
+	logrus.Infoln(newEvent.resourceType, " --- ", newEvent.key, " --- ", newEvent.eventType)
+	return nil
 }
