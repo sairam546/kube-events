@@ -180,6 +180,8 @@ func (c *Controller) processItem(newEvent Event) error {
 		return fmt.Errorf("Error fetching object with key %s from store: %v", newEvent.key, err)
 	}
 	_ = utils.GetObjectMetaData(obj)
+	//need to add deduplication logic
 	logrus.Infoln(newEvent.resourceType, " --- ", newEvent.key, " --- ", newEvent.eventType)
+	//should store some where and it will used for model
 	return nil
 }
