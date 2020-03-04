@@ -1,1 +1,1 @@
-kube-events coming soon
+This is a basic kubernetes controller which listens to all pod events logs to stdout
